@@ -74,6 +74,9 @@
 #include "nvim/memfile.h"
 #include "nvim/memfile_defs.h"
 #include "nvim/memline.h"
+#ifdef NVIM_NUMSTORE
+# include "nvim/nsfile.h"
+#endif
 #include "nvim/memory.h"
 #include "nvim/message.h"
 #include "nvim/option.h"
@@ -258,6 +261,9 @@ typedef enum {
 
 #include "memline.c.generated.h"
 
+#ifdef NVIM_NUMSTORE
+static const char e_numstore_str[] = N_("numstore: %s");
+#endif
 static const char e_ml_get_invalid_lnum_nr[]
   = N_("E315: ml_get: Invalid lnum: %" PRId64);
 static const char e_ml_get_cannot_find_line_nr_in_buffer_nr_str[]
@@ -295,6 +301,10 @@ int ml_open(buf_T *buf)
   buf->b_ml.ml_line_offset = 0;
   buf->b_ml.ml_chunksize = NULL;
   buf->b_ml.ml_usedchunks = 0;
+#ifdef NVIM_NUMSTORE
+  buf->b_ml.ml_nsf = NULL;
+  buf->b_ml.ml_nsf_dirty = false;
+#endif
 
   if (cmdmod.cmod_flags & CMOD_NOSWAPFILE) {
     buf->b_p_swf = false;
@@ -580,6 +590,11 @@ void ml_close(buf_T *buf, int del_file)
   if (buf->b_ml.ml_mfp == NULL) {               // not open
     return;
   }
+#ifdef NVIM_NUMSTORE
+  if (buf->b_ml.ml_nsf != NULL) {
+    ml_nsf_detach(buf);
+  }
+#endif
   mf_close(buf->b_ml.ml_mfp, del_file);       // close the .swp file
   if (buf->b_ml.ml_line_lnum != 0
       && (buf->b_ml.ml_flags & (ML_LINE_DIRTY | ML_ALLOCATED))) {
@@ -603,6 +618,11 @@ void ml_close_all(bool del_file)
   FOR_ALL_BUFFERS(buf) {
     ml_close(buf, del_file);
   }
+#ifdef NVIM_NUMSTORE
+  if (nsf_db_close() == FAIL) {
+    emsg(_("numstore: cannot close the database"));
+  }
+#endif
   spell_delete_wordlist();      // delete the internal wordlist
   vim_deltempdir();             // delete created temp directory
 }
@@ -1713,6 +1733,16 @@ static int recov_file_names(char **names, char *path, bool prepend_dot)
 /// always sync at least one block.
 void ml_sync_all(int check_file, int check_char, bool do_fsync)
 {
+#ifdef NVIM_NUMSTORE
+  // Numstore variables: commit the open transaction. When called while waiting for
+  // input ("check_char"), also reset 'modified': the changes are saved.
+  FOR_ALL_BUFFERS(buf) {
+    if (buf->b_ml.ml_nsf != NULL) {
+      ml_nsf_commit(buf, check_char);
+    }
+  }
+
+#endif
   FOR_ALL_BUFFERS(buf) {
     if (buf->b_ml.ml_mfp == NULL || buf->b_ml.ml_mfp->mf_fname == NULL) {
       continue;                             // no file
@@ -1952,6 +1982,13 @@ errorret:
   // Otherwise may need to flush last used line.
   // Don't use the last used line when 'swapfile' is reset, need to load all
   // blocks.
+#ifdef NVIM_NUMSTORE
+  if (buf->b_ml.ml_line_lnum != lnum && buf->b_ml.ml_nsf != NULL) {
+    if (ml_nsf_get_line(buf, lnum) == FAIL) {
+      goto errorret;
+    }
+  } else
+#endif
   if (buf->b_ml.ml_line_lnum != lnum) {
     ml_flush_line(buf, false);
 
@@ -1986,6 +2023,13 @@ errorret:
     buf->b_ml.ml_line_lnum = lnum;
     buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
   }
+#ifdef NVIM_NUMSTORE
+  if (will_change && buf->b_ml.ml_nsf != NULL) {
+    // The caller changes the copy: write it to the variable on flush.
+    buf->b_ml.ml_flags |= ML_LINE_DIRTY;
+    ml_add_deleted_len_buf(buf, buf->b_ml.ml_line_ptr, -1);
+  } else
+#endif
   if (will_change) {
     buf->b_ml.ml_flags |= (ML_LOCKED_DIRTY | ML_LOCKED_POS);
 #ifdef ML_GET_ALLOC_LINES
@@ -2043,6 +2087,11 @@ static int ml_append_int(buf_T *buf, linenr_T lnum, char *line_arg, colnr_T len_
   if (len == 0) {
     len = (colnr_T)strlen(line) + 1;            // space needed for the text
   }
+#ifdef NVIM_NUMSTORE
+  if (buf->b_ml.ml_nsf != NULL) {
+    return ml_nsf_append(buf, lnum, line, len, flags);
+  }
+#endif
   int64_t space_needed = len + (int64_t)INDEX_SIZE;  // space needed for text + index
 
   memfile_T *mfp = buf->b_ml.ml_mfp;
@@ -2645,6 +2694,12 @@ static int ml_delete_int(buf_T *buf, linenr_T lnum, int flags)
     lowest_marked--;
   }
 
+#ifdef NVIM_NUMSTORE
+  if (buf->b_ml.ml_nsf != NULL) {
+    return ml_nsf_delete(buf, lnum, flags);
+  }
+#endif
+
   // If the file becomes empty the last line is replaced by an empty line.
   if (buf->b_ml.ml_line_count == 1) {       // file becomes empty
     if (flags & ML_DEL_MESSAGE) {
@@ -2802,6 +2857,12 @@ void ml_setmarked(linenr_T lnum)
   if (lowest_marked == 0 || lowest_marked > lnum) {
     lowest_marked = lnum;
   }
+#ifdef NVIM_NUMSTORE
+  if (curbuf->b_ml.ml_nsf != NULL) {
+    nsf_setmarked(curbuf->b_ml.ml_nsf, lnum);
+    return;
+  }
+#endif
 
   // find the data block containing the line
   // This also fills the stack with the blocks from the root to the data block
@@ -2821,6 +2882,15 @@ linenr_T ml_firstmarked(void)
   if (curbuf->b_ml.ml_mfp == NULL) {
     return 0;
   }
+#ifdef NVIM_NUMSTORE
+  if (curbuf->b_ml.ml_nsf != NULL) {
+    linenr_T lnum = nsf_firstmarked(curbuf->b_ml.ml_nsf, lowest_marked);
+    if (lnum != 0) {
+      lowest_marked = lnum + 1;
+    }
+    return lnum;
+  }
+#endif
 
   // The search starts with lowest_marked line. This is the last line where
   // a mark was found, adjusted by inserting/deleting lines.
@@ -2854,6 +2924,13 @@ void ml_clearmarked(void)
   if (curbuf->b_ml.ml_mfp == NULL) {        // nothing to do
     return;
   }
+#ifdef NVIM_NUMSTORE
+  if (curbuf->b_ml.ml_nsf != NULL) {
+    nsf_clearmarked(curbuf->b_ml.ml_nsf);
+    lowest_marked = 0;
+    return;
+  }
+#endif
 
   // The search starts with line lowest_marked.
   for (linenr_T lnum = lowest_marked; lnum <= curbuf->b_ml.ml_line_count;) {
@@ -2909,6 +2986,11 @@ static void ml_flush_line(buf_T *buf, bool noalloc)
     linenr_T lnum = buf->b_ml.ml_line_lnum;
     char *new_line = buf->b_ml.ml_line_ptr;
 
+#ifdef NVIM_NUMSTORE
+    if (buf->b_ml.ml_nsf != NULL) {
+      ml_nsf_flush(buf, lnum, new_line);
+    } else {
+#endif
     bhdr_T *hp = ml_find_line(buf, lnum, ML_FIND);
     if (hp == NULL) {
       siemsg(_("E320: Cannot find line %" PRId64), (int64_t)lnum);
@@ -2966,6 +3048,9 @@ static void ml_flush_line(buf_T *buf, bool noalloc)
         (void)ml_delete_int(buf, lnum, 0);
       }
     }
+#ifdef NVIM_NUMSTORE
+  }
+#endif
     if (!noalloc) {
       xfree(new_line);
     }
@@ -4049,6 +4134,11 @@ static void ml_updatechunk(buf_T *buf, linenr_T line, int len, int updtype)
 /// @return  -1 if information is not available
 int ml_find_line_or_offset(buf_T *buf, linenr_T lnum, int *offp, bool no_ff)
 {
+#ifdef NVIM_NUMSTORE
+  if (buf->b_ml.ml_nsf != NULL) {
+    return ml_nsf_find_line_or_offset(buf, lnum, offp, no_ff);
+  }
+#endif
   bhdr_T *hp;
   int text_end;
   int offset;
@@ -4304,3 +4394,318 @@ int decl(pos_T *lp)
   }
   return r;
 }
+
+#ifdef NVIM_NUMSTORE
+// ---------------------------------------------------------------------------
+// Numstore variable backend
+//
+// A buffer with a file name keeps its lines in a u8 variable of one Numstore database (see
+// nsfile.c) when the file opens as one. Then:
+// - b_ml.ml_nsf is the open file. A transaction is always open.
+// - b_ml.ml_mfp still exists (many places test it for "loaded"), but it only
+//   holds one unused empty line. No swap file is made.
+// - b_ml.ml_line_count is the line count of the file, at least 1. An empty
+//   file is an empty buffer: one empty line and ML_EMPTY.
+// - The cached line (ml_line_ptr) is always an allocated copy. A changed
+//   line (ML_LINE_DIRTY) is written to the file in ml_flush_line().
+// - Changes are committed on ":w", when Nvim waits for input (ml_sync_all()),
+//   and when the buffer is unloaded. Unloading a changed buffer (":q!",
+//   ":e!") rolls back to the last commit.
+
+/// Open the file of "buf" as a Numstore variable. Call it right after ml_open().
+///
+/// @return OK, or FAIL with a message in "errbuf"
+int ml_nsf_attach(buf_T *buf, char *errbuf, size_t errlen)
+  FUNC_ATTR_NONNULL_ALL
+{
+  assert(buf->b_ml.ml_mfp != NULL && buf->b_ml.ml_nsf == NULL);
+  // The first buffer opens the database: the file of "nvim {db} --var
+  // {var}", else the file the buffer names ("nvim foo" is variable "foo" in
+  // database "foo").
+  if (nsf_db_open(nsf_db_path() == NULL ? buf->b_ffname : NULL, errbuf, errlen) == FAIL) {
+    return FAIL;
+  }
+  // The variable has the name of the buffer, as the user typed it.
+  const char *var = buf->b_sfname != NULL ? buf->b_sfname : buf->b_ffname;
+  nsfile_T *nsf = nsf_open(var, errbuf, errlen);
+  if (nsf == NULL) {
+    return FAIL;
+  }
+  if (nsf_begin(nsf) == FAIL) {
+    xstrlcpy(errbuf, nsf_errmsg(nsf), errlen);
+    nsf_close(nsf);
+    return FAIL;
+  }
+  buf->b_ml.ml_nsf = nsf;
+  buf->b_ml.ml_nsf_dirty = false;
+  ml_nsf_sync_count(buf);
+
+  // Numstore keeps the data safe: no swap file.
+  buf->b_p_swf = false;
+  buf->b_may_swap = false;
+  return OK;
+}
+
+/// Commit or roll back, then close the variable of "buf".
+static void ml_nsf_detach(buf_T *buf)
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  if (bufIsChanged(buf)) {
+    // Unloading a changed buffer: discard the changes since the last commit.
+    nsf_rollback(nsf);
+  } else {
+    ml_flush_line(buf, false);
+    if (nsf_commit(nsf) == FAIL) {
+      semsg(_(e_numstore_str), nsf_errmsg(nsf));
+    }
+  }
+  nsf_close(nsf);
+  buf->b_ml.ml_nsf = NULL;
+  buf->b_ml.ml_nsf_dirty = false;
+}
+
+/// Set ml_line_count and ML_EMPTY from the variable.
+static void ml_nsf_sync_count(buf_T *buf)
+{
+  linenr_T count = nsf_line_count(buf->b_ml.ml_nsf);
+  buf->b_ml.ml_line_count = MAX(count, 1);
+  if (count == 0) {
+    buf->b_ml.ml_flags |= ML_EMPTY;
+  } else {
+    buf->b_ml.ml_flags &= ~ML_EMPTY;
+  }
+}
+
+/// Free the cached line. It must not be dirty (flush it first).
+static void ml_nsf_drop_line(buf_T *buf)
+{
+  if (buf->b_ml.ml_line_lnum == 0) {
+    return;
+  }
+  assert(!(buf->b_ml.ml_flags & ML_LINE_DIRTY));
+  if (buf->b_ml.ml_flags & ML_ALLOCATED) {
+    xfree(buf->b_ml.ml_line_ptr);
+  }
+  buf->b_ml.ml_flags &= ~(ML_LINE_DIRTY | ML_ALLOCATED);
+  buf->b_ml.ml_line_lnum = 0;
+  buf->b_ml.ml_line_offset = 0;
+}
+
+/// An empty buffer has one empty line, but its variable has no lines.
+/// Before a change, give the file that empty line.
+static int ml_nsf_materialize(buf_T *buf)
+{
+  if (nsf_line_count(buf->b_ml.ml_nsf) > 0) {
+    return OK;
+  }
+  return nsf_insert(buf->b_ml.ml_nsf, 0, "", 0);
+}
+
+/// ml_append_int() for a Numstore variable.
+static int ml_nsf_append(buf_T *buf, linenr_T lnum, char *line, colnr_T len, int flags)
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  if (ml_nsf_materialize(buf) == FAIL
+      || nsf_insert(nsf, lnum, line, strnlen(line, (size_t)len - 1)) == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+    return FAIL;
+  }
+  buf->b_ml.ml_flags &= ~ML_EMPTY;
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_line_count++;
+  if (flags & ML_APPEND_MARK) {
+    nsf_setmarked(nsf, lnum + 1);
+  }
+  buf->b_ml.ml_nsf_dirty = true;
+  return OK;
+}
+
+/// ml_delete_int() for a Numstore variable.
+static int ml_nsf_delete(buf_T *buf, linenr_T lnum, int flags)
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+
+  if (buf->b_ml.ml_line_count == 1) {
+    // The buffer becomes empty: one empty line, and no lines in the file.
+    if (flags & ML_DEL_MESSAGE) {
+      set_keep_msg(_(no_lines_msg), 0);
+    }
+    if (kv_size(buf->update_callbacks)) {
+      ml_add_deleted_len_buf(buf, ml_get_buf(buf, 1), -1);
+    }
+    ml_nsf_drop_line(buf);
+    if (nsf_line_count(nsf) > 0 && nsf_delete(nsf, 1) == FAIL) {
+      semsg(_(e_numstore_str), nsf_errmsg(nsf));
+      return FAIL;
+    }
+    buf->b_ml.ml_flags |= ML_EMPTY;
+    buf->b_ml.ml_nsf_dirty = true;
+    return OK;
+  }
+
+  ml_add_deleted_len_buf(buf, ml_get_buf(buf, lnum), -1);
+  ml_nsf_drop_line(buf);
+  if (nsf_delete(nsf, lnum) == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+    return FAIL;
+  }
+  if (buf->b_prev_line_count == 0) {
+    buf->b_prev_line_count = buf->b_ml.ml_line_count;
+  }
+  buf->b_ml.ml_line_count--;
+  buf->b_ml.ml_nsf_dirty = true;
+  return OK;
+}
+
+/// Write the changed line "lnum" ("text") to the variable. Called from
+/// ml_flush_line().
+static void ml_nsf_flush(buf_T *buf, linenr_T lnum, const char *text)
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  // The text ends at the first NUL: a caller that changed the line in place
+  // can make it shorter without updating ml_line_textlen.
+  size_t len = strnlen(text, (size_t)buf->b_ml.ml_line_textlen);
+  int ret = nsf_line_count(nsf) == 0
+            ? nsf_insert(nsf, 0, text, len)  // the empty buffer gets its first line
+            : nsf_replace(nsf, lnum, text, len);
+  if (ret == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+  }
+  buf->b_ml.ml_nsf_dirty = true;
+}
+
+/// ml_find_line_or_offset() for a Numstore variable. Only 'fileformat' "unix" and
+/// "dos" (one extra byte per line) are handled for "lnum" to offset.
+static int ml_nsf_find_line_or_offset(buf_T *buf, linenr_T lnum, int *offp, bool no_ff)
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  int ffdos = !no_ff && (get_fileformat(buf) == EOL_DOS);
+
+  ml_flush_line(buf, false);
+  linenr_T count = nsf_line_count(nsf);
+  if (count == 0 || lnum < 0) {
+    // Empty buffer: it behaves like one empty line.
+    if (no_ff && (lnum == 1 || lnum == 2)) {
+      return lnum - 1;
+    }
+    return -1;
+  }
+
+  if (lnum > 0) {
+    if (lnum > count + 1) {
+      return -1;
+    }
+    // In the buffer each line has a line break, also the last one.
+    int64_t size = lnum <= count
+                   ? nsf_line_offset(nsf, lnum)
+                   : (int64_t)nsf_size(nsf) + (nsf_noeol(nsf) ? 1 : 0);
+    if (ffdos) {
+      size += lnum - 1;
+    }
+    // Don't count the last line break if 'noeol' and ('bin' or 'nofixeol').
+    if ((!buf->b_p_fixeol || buf->b_p_bin) && !buf->b_p_eol && lnum > count) {
+      size -= ffdos + 1;
+    }
+    return (int)size;
+  }
+
+  // lnum == 0: find the line that holds byte "*offp".
+  int offset = offp == NULL ? 0 : *offp;
+  if (offset <= 0) {
+    return 1;
+  }
+  size_t col = 0;
+  linenr_T found = nsf_offset_line(nsf, (uint64_t)offset, &col);
+  if (found == 0 && nsf_noeol(nsf) && (uint64_t)offset == nsf_size(nsf)) {
+    // The line break of the last line is not in the file.
+    found = count;
+    col = (size_t)(offset - nsf_line_offset(nsf, count));
+  }
+  if (found == 0) {
+    return -1;
+  }
+  *offp = (int)col;
+  return found;
+}
+
+/// Commit the changes of "buf" and begin a new transaction.
+///
+/// @param reset_changed  also reset 'modified' (not from a signal handler)
+/// @return OK or FAIL
+int ml_nsf_commit(buf_T *buf, bool reset_changed)
+  FUNC_ATTR_NONNULL_ALL
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  if (nsf == NULL) {
+    return FAIL;
+  }
+  ml_flush_line(buf, false);
+  if (!buf->b_ml.ml_nsf_dirty && nsf_in_txn(nsf)) {
+    return OK;
+  }
+  int ret = nsf_commit(nsf);
+  if (ret == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+  } else {
+    buf->b_ml.ml_nsf_dirty = false;
+  }
+  if (nsf_begin(nsf) == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+    ret = FAIL;
+  }
+  if (ret == OK && reset_changed && buf->b_changed) {
+    unchanged(buf, true, false);
+    u_unchanged(buf);
+    u_update_save_nr(buf);
+  }
+  return ret;
+}
+
+/// ":w" of a smart-file buffer: set the last line break from 'eol' and
+/// 'fixeol', then commit.
+///
+/// @return OK or FAIL
+int ml_nsf_save(buf_T *buf)
+  FUNC_ATTR_NONNULL_ALL
+{
+  nsfile_T *nsf = buf->b_ml.ml_nsf;
+  ml_flush_line(buf, false);
+  bool eol = buf->b_p_eol || (buf->b_p_fixeol && !buf->b_p_bin);
+  if (nsf_set_eol(nsf, eol) == FAIL) {
+    semsg(_(e_numstore_str), nsf_errmsg(nsf));
+    return FAIL;
+  }
+  buf->b_ml.ml_nsf_dirty = true;  // always commit on ":w"
+  return ml_nsf_commit(buf, false);
+}
+
+/// ml_get_buf_impl() for a Numstore variable: load line "lnum" into the
+/// line cache.
+static int ml_nsf_get_line(buf_T *buf, linenr_T lnum)
+{
+  static int recursive = 0;
+
+  ml_flush_line(buf, false);
+  size_t len = 0;
+  const char *p = "";
+  if (nsf_line_count(buf->b_ml.ml_nsf) > 0) {  // else: empty buffer, one empty line
+    p = nsf_get(buf->b_ml.ml_nsf, lnum, &len);
+    if (p == NULL) {
+      if (recursive == 0) {
+        recursive++;
+        semsg(_(e_numstore_str), nsf_errmsg(buf->b_ml.ml_nsf));
+        recursive--;
+      }
+      return FAIL;
+    }
+  }
+  // Always a copy: nsf_get() reuses its buffer.
+  buf->b_ml.ml_line_ptr = xmemdupz(p, len);
+  buf->b_ml.ml_line_textlen = (colnr_T)len + 1;
+  buf->b_ml.ml_line_lnum = lnum;
+  buf->b_ml.ml_flags = (buf->b_ml.ml_flags & ~ML_LINE_DIRTY) | ML_ALLOCATED;
+  return OK;
+}
+#endif  // NVIM_NUMSTORE

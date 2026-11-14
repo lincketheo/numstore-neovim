@@ -54,6 +54,10 @@
 #include "nvim/undo_defs.h"
 #include "nvim/vim_defs.h"
 
+#ifdef NVIM_NUMSTORE
+# include "nvim/nsfile.h"
+#endif
+
 static const char *err_readonly = "is read-only (cannot override: \"W\" in 'cpoptions')";
 static const char e_patchmode_cant_touch_empty_original_file[]
   = N_("E206: Patchmode: can't touch empty original file");
@@ -1143,6 +1147,47 @@ int buf_write(buf_T *buf, char *fname, char *sfname, linenr_T start, linenr_T en
 
   vim_acl_T acl = NULL;                 // ACL copied from original file to
                                         // backup or new file
+
+#ifdef NVIM_NUMSTORE
+  // A Numstore buffer: the text is already in the database. ":w" commits it.
+  if (buf->b_ml.ml_nsf != NULL && overwriting && whole && !append && !filtering) {
+    buf->b_saving = true;
+    if (ml_nsf_save(buf) == FAIL) {
+      err = set_err(_("numstore: cannot commit"));
+      goto fail;
+    }
+    no_wait_return--;
+    add_quoted_fname(IObuff, IOSIZE, buf, fname);
+    xstrlcat(IObuff, _("[numstore]"), IOSIZE);
+    if (!buf->b_p_eol && !(buf->b_p_fixeol && !buf->b_p_bin)) {
+      xstrlcat(IObuff, _("[noeol]"), IOSIZE);
+    }
+    msg_add_lines(true, buf->b_ml.ml_line_count, (off_T)nsf_size(buf->b_ml.ml_nsf));
+    if (!shortmess(kShmWrite)) {
+      xstrlcat(IObuff, shortmess(kShmWri) ? _(" [w]") : _(" committed"), IOSIZE);
+    }
+    set_keep_msg(msg_with_id(IObuff, msg_id, "bufwrite", NULL, 0, true, true, false), 0);
+    if (reset_changed && buf_get_changedtick(buf) == write_tick) {
+      unchanged(buf, true, false);
+      const varnumber_T changedtick = buf_get_changedtick(buf);
+      if (buf->b_last_changedtick + 1 == changedtick) {
+        buf->b_last_changedtick = changedtick;
+      }
+      u_unchanged(buf);
+      u_update_save_nr(buf);
+    }
+    buf->b_flags &= ~BF_WRITE_MASK;
+    goto nofail;
+  }
+
+  // All text lives in the Numstore database: never write a real file from a
+  // normal buffer. (Filtering writes a temp file: that is allowed.)
+  if (*buf->b_p_bt == NUL && !filtering) {
+    err = set_err(_("numstore: only \":w\" of a whole numstore buffer is supported, "
+                    "no file is written"));
+    goto fail;
+  }
+#endif
 
   if (get_fileinfo(buf, fname, overwriting, forceit, &file_info_old, &perm, &device, &newfile,
                    &file_readonly, &err) == FAIL) {

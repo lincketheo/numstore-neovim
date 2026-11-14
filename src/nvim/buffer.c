@@ -115,6 +115,10 @@
 #include "nvim/version.h"
 #include "nvim/vim_defs.h"
 #include "nvim/window.h"
+
+#ifdef NVIM_NUMSTORE
+# include "nvim/nsfile.h"
+#endif
 #include "nvim/winfloat.h"
 
 #include "buffer.c.generated.h"
@@ -239,6 +243,52 @@ bool buf_ensure_loaded(buf_T *buf)
   return status != FAIL && bufref_valid(&bufref) && buf->b_ml.ml_mfp != NULL;
 }
 
+#ifdef NVIM_NUMSTORE
+/// Finish opening a buffer whose text is in a Numstore variable (after
+/// ml_nsf_attach()): set the options that readfile() would set, give the
+/// file message and apply the BufReadPre and BufReadPost autocommands.
+///
+/// @return  OK
+static int nsf_read_post(exarg_T *eap, bool silent)
+{
+  curbuf->b_flags &= ~(BF_NEW | BF_NEW_W | BF_CHECK_RO | BF_NOTEDITED);
+  set_fileformat(EOL_UNIX, OPT_LOCAL);
+  curbuf->b_p_eol = !nsf_noeol(curbuf->b_ml.ml_nsf);
+
+  apply_autocmds_exarg(EVENT_BUFREADPRE, NULL, curbuf->b_fname, false, curbuf, eap);
+
+  if (!silent && curbuf->b_ml.ml_nsf != NULL) {
+    add_quoted_fname(IObuff, IOSIZE, curbuf, curbuf->b_fname);
+    xstrlcat(IObuff, _("[numstore]"), IOSIZE);
+    if (!curbuf->b_p_eol) {
+      xstrlcat(IObuff, _("[noeol]"), IOSIZE);
+    }
+    msg_add_lines(true, nsf_line_count(curbuf->b_ml.ml_nsf),
+                  (off_T)nsf_size(curbuf->b_ml.ml_nsf));
+    msg_trunc(IObuff, false, 0);
+  }
+
+  apply_autocmds_exarg(EVENT_BUFREADPOST, NULL, curbuf->b_fname, false, curbuf, eap);
+  return OK;
+}
+
+/// open_buffer() for a buffer that keeps its text in a u8 variable of the
+/// Numstore database, named after the buffer. When numstore refuses the
+/// variable (bad name, not u8), the buffer stays empty and cannot be
+/// changed: there is no fallback to a real file.
+static int nsf_open_buffer(exarg_T *eap, bool silent)
+{
+  char nserr[256] = "";
+  if (ml_nsf_attach(curbuf, nserr, sizeof(nserr)) == OK) {
+    return nsf_read_post(eap, silent);
+  }
+  semsg(_("numstore: %s: %s"), curbuf->b_fname, nserr);
+  curbuf->b_p_ma = false;
+  curbuf->b_p_ro = true;
+  return FAIL;
+}
+#endif
+
 /// Open current buffer, that is: open the memfile and read the file into
 /// memory.
 ///
@@ -334,9 +384,19 @@ int open_buffer(bool read_stdin, exarg_T *eap, int flags_arg)
     }
 #endif
 
+#ifdef NVIM_NUMSTORE
+    if (!read_fifo && *curbuf->b_p_bt == NUL && !curbuf->b_help
+        && !os_isdir(curbuf->b_ffname)
+        && !has_autocmd(EVENT_BUFREADCMD, curbuf->b_fname, curbuf)) {  // a plugin reads it
+      retval = nsf_open_buffer(eap, silent);
+    } else {
+#endif
     retval = readfile(curbuf->b_ffname, curbuf->b_fname,
                       0, 0, (linenr_T)MAXLNUM, eap,
                       flags | READ_NEW | (read_fifo ? READ_FIFO : 0), silent);
+#ifdef NVIM_NUMSTORE
+  }
+#endif
 #ifdef UNIX
     if (read_fifo) {
       curbuf->b_p_bin = save_bin;
